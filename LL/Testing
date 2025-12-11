@@ -1,0 +1,376 @@
+'use strict';
+
+/*
+  Sarthi Pluse+ - content.js (updated)
+  - Fix: ensure "Hide Media Controls" setting actually hides Prev / Play / Next / +Files reliably,
+    even after page actions, reloads or when the panel is re-inserted by the script/page.
+  - Approach:
+    * Add a dedicated style element (#__sp_hide_media_style) that contains a rule with !important to force-hide
+      the media control elements by ID (#sp-prev, #sp-play, #sp-next, #sp-add-files).
+    * Expose applyHideMediaStyle(flag) and call it whenever theme is applied, on startup (read persisted flags),
+      and when the MutationObserver detects panel injections.
+    * This overrides inline styles with !important and persists across DOM replacements.
+  - No other behavior removed. Auto-run UI is still hidden visually per previous changes.
+*/
+
+/* ----- Safe messaging helper ----- */
+function safeSendMessageAsync(message, opts = {}) {
+  const retries = (opts.retries == null) ? 1 : Number(opts.retries);
+  const retryDelay = (opts.retryDelayMs == null) ? 220 : Number(opts.retryDelayMs);
+
+  return new Promise((resolve, reject) => {
+    let attempts = 0;
+
+    function attempt() {
+      attempts++;
+      try {
+        if (!chrome || !chrome.runtime || typeof chrome.runtime.sendMessage !== 'function') {
+          return onFail(new Error('chrome.runtime.sendMessage unavailable'));
+        }
+
+        chrome.runtime.sendMessage(message, (resp) => {
+          if (chrome.runtime && chrome.runtime.lastError) {
+            return onFail(new Error(chrome.runtime.lastError.message || 'runtime.lastError'));
+          }
+          return resolve(resp);
+        });
+      } catch (e) {
+        onFail(e);
+      }
+    }
+
+    function onFail(err) {
+      if (attempts <= retries) {
+        setTimeout(attempt, retryDelay);
+        return;
+      }
+      if (typeof opts.fallback === 'function') {
+        try {
+          const fb = opts.fallback(err);
+          if (fb && typeof fb.then === 'function') {
+            fb.then(res => resolve(res)).catch(e => reject(e));
+            return;
+          }
+          resolve(fb);
+        } catch (e) {
+          reject(e);
+        }
+        return;
+      }
+      reject(err);
+    }
+
+    attempt();
+  });
+}
+
+/* Respect global extension-level disable flag (toggled by toolbar icon). */
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (!msg || msg.type !== 'SP_EXTENSION_TOGGLE') return;
+  try { location.reload(); } catch (e) {}
+});
+
+/* Load enabled/disabled from storage and start main if enabled */
+chrome.storage.local.get(['sp_extension_disabled'], (d) => {
+  const disabled = !!d.sp_extension_disabled;
+  if (!disabled) {
+    try { main(); } catch (e) { console.warn('SP main init failed', e); }
+  } else {
+    try { console.log('Sarthi Pluse+ content script: disabled for this tab'); } catch {}
+  }
+});
+
+function main(){
+  // --- Constants / Keys ---
+  const SP_DEFAULT_SERIAL_KEY = "A25C562SF524FHE5";
+  const SP_ACTIVATION_FLAG_KEY = "sp_activated";
+  const SP_ACTIVATION_HASH_KEY = "sp_activation_hash";
+
+  // Virtual webcam keys
+  const SP_VCAM_ENABLED_KEY = "sp_vcam_enabled";
+  const SP_VCAM_FORCE_KEY   = "sp_vcam_force_all";
+  const SP_VCAM_ZOOM_KEY    = "sp_vcam_zoom";
+  const SP_VCAM_FPS_KEY     = "sp_vcam_fps";
+
+  // Image defaults key
+  const SP_IMG_DEFAULTS_KEY = "sp_img_defaults"; // {bri,con,sat,hue,fmt,qual}
+
+  // Playlist images key - session-only intent
+  const SP_VCAM_PLAYLIST_IMAGES_KEY = 'sp_vcam_playlist_images_session';
+
+  // Activity logs key (used by popup.js)
+  const SP_ACTIVITY_LOGS_KEY = 'sp_activity_logs';
+
+  // Persisted theme key
+  const SP_THEME_KEY = 'sp_theme';
+
+  // ----- Panel theme flags (persisted by panelThemeBridge) -----
+  window.__sp_panel_theme_flags = window.__sp_panel_theme_flags || { hideFloatingAdd: false, hideFloatingReset: false, hideMediaButtons: false };
+
+  // Utility to apply/remove a dedicated style that forces hiding media controls.
+  function applyHideMediaStyle(hide) {
+    try {
+      const STYLE_ID = '__sp_hide_media_style';
+      const existing = document.getElementById(STYLE_ID);
+      if (hide) {
+        const css = `
+          /* Force-hide media control buttons */
+          #sp-prev, #sp-play, #sp-next, #sp-add-files {
+            display: none !important;
+            visibility: hidden !important;
+            pointer-events: none !important;
+          }
+        `;
+        if (existing) {
+          existing.textContent = css;
+        } else {
+          const s = document.createElement('style');
+          s.id = STYLE_ID;
+          s.textContent = css;
+          (document.head || document.documentElement).appendChild(s);
+        }
+      } else {
+        if (existing) try { existing.remove(); } catch (e) {}
+      }
+      window.__sp_panel_theme_flags = window.__sp_panel_theme_flags || {};
+      window.__sp_panel_theme_flags.hideMediaButtons = !!hide;
+    } catch (e) { /* ignore */ }
+  }
+  // expose for debugging
+  window.__sp_applyHideMediaButtons = applyHideMediaStyle;
+
+  // --- Utilities ---
+  async function sha256Hex(str) {
+    try {
+      const enc = new TextEncoder().encode(String(str));
+      const buf = await crypto.subtle.digest("SHA-256", enc);
+      const bytes = Array.from(new Uint8Array(buf));
+      return bytes.map(b => b.toString(16).padStart(2, "0")).join("");
+    } catch {
+      return "";
+    }
+  }
+  async function spExpectedHash() { return await sha256Hex(SP_DEFAULT_SERIAL_KEY); }
+  function spGetStoredActivation(cb) { chrome.storage.local.get([SP_ACTIVATION_FLAG_KEY, SP_ACTIVATION_HASH_KEY], d => cb(d || {})); }
+  function spCheckActivation(cb) {
+    spGetStoredActivation(async (d) => {
+      const flag = !!d[SP_ACTIVATION_FLAG_KEY];
+      const savedHash = d[SP_ACTIVATION_HASH_KEY] || "";
+      const exp = await spExpectedHash();
+      cb(Boolean(savedHash && savedHash === exp) || flag);
+    });
+  }
+  function spSetActivatedWithHash(hash, cb) { chrome.storage.local.set({ [SP_ACTIVATION_FLAG_KEY]: true, [SP_ACTIVATION_HASH_KEY]: hash }, cb); }
+
+  function showPanelToast(msg, variant='info', duration=1600){
+    try {
+      const prev = document.getElementById('sp-toast'); if(prev) prev.remove();
+      const el = document.createElement('div'); el.id='sp-toast'; el.className=`sp-toast ${variant}`; el.textContent=msg;
+      document.documentElement.appendChild(el);
+      requestAnimationFrame(()=>el.classList.add('show'));
+      setTimeout(()=>{ el.classList.remove('show'); setTimeout(()=>{ try{ el.remove(); }catch{} },260); }, duration);
+    } catch {}
+  }
+
+  // ========== IMAGE DEFAULTS ==========
+  function getImageDefaults(cb){
+    chrome.storage.local.get([SP_IMG_DEFAULTS_KEY], (d)=>{
+      const def = d[SP_IMG_DEFAULTS_KEY] || { bri:1, con:1, sat:1, hue:0, fmt:'image/jpeg', qual:0.75 };
+      cb(def);
+    });
+  }
+  function setImageDefaults(def, cb){
+    const safe = {
+      bri: Math.max(0.5, Math.min(1.5, Number(def.bri)||1)),
+      con: Math.max(0.5, Math.min(1.5, Number(def.con)||1)),
+      sat: Math.max(0,   Math.min(2.0, Number(def.sat)||1)),
+      hue: Math.max(-180, Math.min(180, Number(def.hue)||0)),
+      fmt: (def.fmt==='image/png'||def.fmt==='image/webp')?def.fmt:'image/jpeg',
+      qual: Math.min(1, Math.max(0.3, Number(def.qual)||0.75))
+    };
+    chrome.storage.local.set({ [SP_IMG_DEFAULTS_KEY]: safe }, cb);
+  }
+  async function applyDefaultsToDataUrl(inputDu){
+    return new Promise((resolve)=>{
+      if (!inputDu || typeof inputDu!=='string' || !inputDu.startsWith('data:image/')) return resolve(inputDu);
+      getImageDefaults((def)=>{
+        try{
+          const img = new Image();
+          img.crossOrigin = 'anonymous';
+          img.onload = ()=>{
+            try{
+              const w = Math.max(1, img.naturalWidth||img.width||640);
+              const h = Math.max(1, img.naturalHeight||img.height||480);
+              const maxDim = 800;
+              const scale = Math.min(1, Math.max(0.25, Math.min(maxDim / Math.max(w,h), 1)));
+              const cw = Math.max(1, Math.floor(w * scale));
+              const ch = Math.max(1, Math.floor(h * scale));
+              const cvs = document.createElement('canvas'); cvs.width=cw; cvs.height=ch;
+              const ctx = cvs.getContext('2d');
+              ctx.save();
+              ctx.filter = `brightness(${def.bri}) contrast(${def.con}) saturate(${def.sat}) hue-rotate(${def.hue}deg)`;
+              ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
+              ctx.fillStyle = '#ffffff'; ctx.fillRect(0,0,cw,ch);
+              ctx.drawImage(img, 0, 0, cw, ch);
+              ctx.restore();
+              const out = def.fmt==='image/png' ? cvs.toDataURL('image/png')
+                        : def.fmt==='image/webp' ? cvs.toDataURL('image/webp', def.qual)
+                        : cvs.toDataURL('image/jpeg', def.qual);
+              resolve(out);
+            }catch{ resolve(inputDu); }
+          };
+          img.onerror = ()=>resolve(inputDu);
+          img.src = inputDu;
+        }catch{ resolve(inputDu); }
+      });
+    });
+  }
+
+  // ========== EARLY 403 GUARD & HARDEN ==========
+  (function early403Guard() {
+    if (location.hostname !== "sarathi.parivahan.gov.in") return;
+    const STABLE_URL = "https://sarathi.parivahan.gov.in/sarathiservice/authenticationaction.do?authtype=Anugnya";
+    const href = location.href;
+    try {
+      const text = (document.body && document.body.innerText || "").toLowerCase();
+      const codeMatch = /\b(403|600|401|404|500)\b/;
+      if (href.includes("/403.jsp") || (href.includes("authenticationaction.do") && href.includes("authtype=Anugyna")) ||
+          (codeMatch.test(text) && text.includes("forbidden")) ) {
+        const k = "__sp403_ts"; const last = Number(sessionStorage.getItem(k) || 0);
+        if (Date.now() - last > 3000) {
+          sessionStorage.setItem(k, String(Date.now()));
+          try { location.replace(STABLE_URL); } catch(e) { location.href = STABLE_URL; }
+        }
+      }
+    } catch {}
+  })();
+
+  (function harden() {
+    if (location.hostname !== "sarathi.parivahan.gov.in") return;
+    try {
+      document.querySelectorAll('script').forEach(s=>{ if (s.textContent.includes('debugger')) s.textContent = s.textContent.replace(/debugger;/g,''); });
+      window.alert = function(){};
+      window.onkeydown = null; window.onkeyup = null; window.onkeypress = null;
+      document.onkeydown = null; document.onkeyup = null; document.onkeypress = null;
+      document.addEventListener('visibilitychange', e=>e.stopImmediatePropagation(), true);
+      window.addEventListener('blur', e=>e.stopImmediatePropagation(), true);
+      window.addEventListener('focus', e=>e.stopImmediatePropagation(), true);
+      const _si = window.setInterval; window.setInterval = function(fn, d, ...a){ if(typeof fn==="string"&&fn.includes("debugger")) return 0; return _si(fn,d,...a); };
+      const _st = window.setTimeout;  window.setTimeout  = function(fn, d, ...a){ if(typeof fn==="string"&&fn.includes("debugger")) return 0; return _st(fn,d,...a); };
+      try { Object.defineProperty(window,"outerHeight",{get:()=>window.innerHeight+100}); Object.defineProperty(window,"outerWidth",{get:()=>window.innerWidth+100}); } catch {}
+    } catch {}
+    function dom403Guard(){
+      try {
+        const t = (document.body && document.body.innerText || "").toLowerCase();
+        const codeMatch = /\b(403|600|401|404|500)\b/;
+        if ((t.includes("403") || codeMatch.test(t)) && t.includes("forbidden")) {
+          const STABLE_URL = "https://sarathi.parivahan.gov.in/sarathiservice/authenticationaction.do?authtype=Anugyna";
+          const k="__sp403_dom_ts"; const last=Number(sessionStorage.getItem(k)||0);
+          if (Date.now()-last>3000){ sessionStorage.setItem(k,String(Date.now())); try { location.replace(STABLE_URL); } catch(e) { location.href = STABLE_URL; } }
+        }
+      }catch{}
+    }
+    document.addEventListener("DOMContentLoaded", dom403Guard, {once:true});
+    setTimeout(dom403Guard, 400); setTimeout(dom403Guard, 1200); setTimeout(dom403Guard, 2400);
+  })();
+
+  // ========== STYLES ==========
+  (function ensureStyles(){
+    if (document.getElementById('sp-styles')) return;
+    const css = `
+      /* Panel + UI */
+      :root {
+        --sp-bg-grad-start: #081226;
+        --sp-bg-grad-end: rgba(255,255,255,0.04);
+        --sp-accent1: #8a6cff;
+        --sp-accent2: #00c2ff;
+        --sp-accent-cta: #f6b24a;
+        --sp-muted: rgba(255,255,255,0.85);
+      }
+      .sp-toast{position:fixed!important;top:96px;left:50%;transform:translateX(-50%) translateY(-8px);opacity:0;padding:8px 14px;border-radius:12px;font-weight:800;font-size:13px;color:#071226;box-shadow:0 8px 30px rgba(4,6,18,.6);z-index:2147483647;transition:opacity .22s ease,transform .22s ease;pointer-events:none;max-width:calc(100% - 140px);text-align:center}
+      .sp-toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+      .sp-toast.info{background:linear-gradient(90deg,var(--sp-accent1),var(--sp-accent2)); color: #fff;}
+      .sp-toast.success{background:linear-gradient(90deg,#27ae60,#2ecc71); color: #fff;}
+      .sp-toast.error{background:linear-gradient(90deg,#e74c3c,#c0392b); color: #fff;}
+
+      #sp-top-panel{position:fixed!important;top:0;width: 100%;height:84px;z-index:2147483646;backdrop-filter:saturate(120%) blur(14px);background:linear-gradient(150deg,var(--sp-bg-grad-start), var(--sp-bg-grad-end));border-radius:0px;border:1px solid rgba(255,255,255,.04);box-shadow:0 18px 40px rgba(3,8,20,.6);display:flex;align-items:center;justify-content:center;pointer-events:auto;transition:transform .45s cubic-bezier(.22,.61,.36,1)}
+      #sp-top-panel.collapsed{transform:translateY(-110%);pointer-events:none}
+      #sp-top-panel .sp-inner{position:relative;display:flex;align-items:center;justify-content:center;gap:10px;flex-wrap:wrap;max-width:100%;padding:6px 12px;width:100%}
+      #sp-brand{position:absolute;left:14px;top:50%;transform:translateY(-50%);font-weight:900;font-size:20px;letter-spacing:.3px;color:var(--sp-muted);text-shadow:0 2px 8px rgba(0,0,0,.5);font-family:"Segoe UI",system-ui,-apple-system,Roboto,Arial,sans-serif;user-select:none}
+      .sp-btn,.sp-mini-btn,.sp-icon-btn{appearance:none;border:none;outline:none;border-radius:10px;display:inline-flex;align-items:center;justify-content:center;height:28px;min-height:28px;padding:0 12px;font-weight:800;font-size:12px;color:#071226;cursor:pointer;box-shadow:0 6px 20px rgba(5,7,20,.6);transition:transform .08s ease,opacity .12s ease, box-shadow .12s;white-space:nowrap;line-height:26px}
+      .sp-btn{background:linear-gradient(90deg,var(--sp-accent1),var(--sp-accent2)); color: #fff; border: 1px solid rgba(255,255,255,0.06)}
+      .sp-mini-btn{background:linear-gradient(90deg,#0f1b34,#12243b); color: var(--sp-muted); border:1px solid rgba(255,255,255,0.04); padding:0 9px}
+      .sp-btn.success{background:linear-gradient(90deg,#27ae60,#2ecc71); color: #fff;}
+      .sp-btn.warn{background:linear-gradient(90deg,#f6b24a,#f09b2d); color:#071226;}
+      .sp-btn.danger{background:linear-gradient(90deg,#e74c3c,#c0392b); color:#fff;}
+      .sp-btn.gray{background:linear-gradient(90deg,#2b394a,#203043); color:var(--sp-muted); border:1px solid rgba(255,255,255,0.02)}
+      .sp-btn.blue{background:linear-gradient(90deg,#1e90ff,#0077cc); color:#fff}
+      .sp-btn:hover,.sp-mini-btn:hover,.sp-icon-btn:hover{opacity:.98;transform:translateY(-2px); box-shadow:0 14px 30px rgba(4,8,24,.55)}
+      .sp-icon-btn{width:28px;padding:0;border-radius:50%;background:linear-gradient(135deg,var(--sp-accent1),var(--sp-accent2));font-size:15px;font-weight:900;color:#fff}
+      #sp-toggle{position:fixed!important;top:10px;right:54px;width:20px;height:20px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;border:1px solid rgba(255,255,255,.08);background:rgba(0,0,0,.22);color:#fff;font-size:12px;line-height:1;cursor:pointer;z-index:2147483647;box-shadow:0 6px 18px rgba(0,0,0,.25)}
+      #sp-launcher{position:fixed!important;right:18px;bottom:18px;width:48px;height:48px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:900;font-size:14px;background:linear-gradient(135deg,var(--sp-accent1),var(--sp-accent-cta));color:#071226;cursor:pointer;z-index:2147483647;border:1px solid rgba(255,255,255,0.06);box-shadow:0 16px 40px rgba(0,0,0,.28)}
+      #sp-img-thumb{width:70px;height:70px;border-radius:12px;object-fit:cover;border:0;box-shadow:0 8px 24px rgba(2,6,20,.6);background:#ffffff;user-select:none;cursor:pointer;display:block}
+      #sp-vcam-toggle{ display:none !important; }
+
+      /* Floating add-script button (top-right very small) with transition */
+      #sp-save-script-open-floating {
+        position: fixed !important;
+        right: 12px;
+        top: 12px;
+        width: 28px;
+        height: 28px;
+        border-radius: 6px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-weight: 900;
+        font-size: 14px;
+        background: linear-gradient(135deg,var(--sp-accent1),var(--sp-accent2));
+        color: #071226;
+        z-index: 2147483647;
+        cursor: pointer;
+        box-shadow: 0 12px 30px rgba(0,0,0,0.35);
+        border: 1px solid rgba(255,255,255,0.06);
+        transition: transform .28s cubic-bezier(.2,.9,.26,1), opacity .28s cubic-bezier(.2,.9,.26,1);
+        opacity: 1;
+      }
+      #sp-save-script-open-floating.hidden { opacity: 0; transform: scale(.8) translateY(-6px); pointer-events: none; }
+
+      /* Floating reset button (left-top small icon) - smaller and top margin 0 */
+      #sp-reset-floating {
+        position: fixed !important;
+        left: 12px;
+        top: 0px; /* top margin 0 per request */
+        width: 24px; /* smaller */
+        height: 24px;
+        border-radius: 6px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-weight: 800;
+        font-size: 12px;
+        background: linear-gradient(135deg,#e74c3c,#c0392b);
+        color: #fff;
+        z-index: 2147483647;
+        cursor: pointer;
+        box-shadow: 0 12px 30px rgba(0,0,0,0.35);
+        border: 1px solid rgba(255,255,255,0.06);
+        transition: transform .28s cubic-bezier(.2,.9,.26,1), opacity .28s cubic-bezier(.2,.9,.26,1);
+        opacity: 1;
+      }
+      #sp-reset-floating.hidden { opacity: 0; transform: scale(.8) translateY(-6px); pointer-events: none; }
+
+      /* Tray positioned inside panel near add-icon and hidden by default. */
+      #sp-tray{ position:absolute; top:46px; right:40px; width: 340px; max-width: 92vw; background: #071226; color: #e6eef8; border-radius: 8px; box-shadow: 0 10px 40px rgba(2,6,20,0.6); padding: 10px; z-index:2147483648; display:none; border:1px solid rgba(255,255,255,0.04)}
+      #sp-tray.open{ display:block; }
+      #sp-tray .sp-tray-hdr{ font-weight:800; color:var(--sp-accent2); margin-bottom:6px }
+      #sp-tray .sp-row{ display:flex; gap:8px; align-items:center }
+      .sp-input, .sp-textarea { width:100%; border-radius:6px; padding:8px; background:#071226; color:#e6eef8; border:1px solid rgba(255,255,255,0.04) }
+      .sp-textarea { min-height: 80px; resize:vertical }
+
+      /* Classic editor activation overlay width reduced */
+      #sp-activation-modal{position:relative;background:#071226;border-radius:12px;box-shadow:0 30px 80px rgba(0,0,0,.6);min-width:320px;max-width:88vw;padding:18px;border:1px solid rgba(255,255,255,0.04);color:#e6eef8;font-family:"Segoe UI",system-ui,-apple-system,Roboto,Arial,sans-serif}
+
+      /* Classic editor */
+      #sp-classic-overlay{ position:fixed; inset:0; z-index:2147483647; display:flex; align-items:center; justify-content:center; background: rgba(2,6,20,0.75) }
+      #sp-classic-modal{ width: min(1000px, 94vw); max-height: 92vh; overflow:auto; background:#071226; color:#e6eef8; border-radius:12px; padding:12px; box-shadow: 0 30px 80px rgba(0,0,0,.6); border:1px solid rgba(255,255,255,0.04); font-family:"
